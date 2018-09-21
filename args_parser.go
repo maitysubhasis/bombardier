@@ -261,14 +261,32 @@ func parsePrintSpec(spec string) (bool, bool, bool, error) {
 	return pi, pp, pr, nil
 }
 
-var re = regexp.MustCompile(`^https?:\/\/.*$`)
+var re = regexp.MustCompile(`^(?P<proto>.+:\/\/)?.*$`)
 
 func tryParseURL(raw string) (string, error) {
 	rs := raw
+
+	// Try the parse.
+	m := re.FindStringSubmatch(rs)
+	if m == nil {
+		// Just in case.
+		return "", fmt.Errorf(
+			"%v does not appear to be a valid URL",
+			raw,
+		)
+	}
+
 	// If the URL doesn't start with a scheme, assume that the user
 	// meant 'http'.
-	if !re.MatchString(rs) {
+	proto := m[1]
+	if proto == "" {
 		rs = "http://" + rs
+	} else if proto != "http://" && proto != "https://" {
+		// We're not interested in other protocols.
+		return "", fmt.Errorf(
+			"%q is not an acceptable protocol (http, https): %v",
+			proto, raw,
+		)
 	}
 
 	u, err := url.Parse(rs)
@@ -291,8 +309,8 @@ func tryParseURL(raw string) (string, error) {
 	host, port, err := net.SplitHostPort(u.Host)
 	if err != nil {
 		return "", fmt.Errorf(
-			"%v seems to have invalid 'host:port' part: %v",
-			raw, err,
+			"%v does not appear to be a valid URL",
+			raw,
 		)
 	}
 
