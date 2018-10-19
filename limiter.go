@@ -44,6 +44,7 @@ func newBucketLimiter(rate uint64) limiter {
 	}
 }
 
+// ??
 func (b *bucketlimiter) pace(done <-chan struct{}) (res token) {
 	wd := b.limiter.Take(1)
 	if wd <= 0 {

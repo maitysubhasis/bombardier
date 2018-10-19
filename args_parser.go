@@ -21,6 +21,7 @@ type kingpinParser struct {
 
 	numReqs      *nullableUint64
 	duration     *nullableDuration
+	interval     *nullableDuration
 	headers      *headersList
 	numConns     uint64
 	timeout      time.Duration
@@ -118,6 +119,11 @@ func newKingpinParser() argsParser {
 		PlaceHolder(defaultTestDuration.String()).
 		Short('d').
 		SetValue(kparser.duration)
+
+	app.Flag("interval", "Request interval in us").
+		PlaceHolder(defaultRequestInterval.String()).
+		Short('i').
+		SetValue(kparser.interval)
 
 	app.Flag("rate", "Rate limit in requests per second").
 		PlaceHolder("[pos. int.]").

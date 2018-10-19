@@ -12,13 +12,20 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/codesenberg/bombardier/internal"
+	// "github.com/codesenberg/bombardier/internal"
 
+	// "github.com/bombardier/internal"
 	"github.com/cheggaaa/pb"
 	fhist "github.com/codesenberg/concurrent/float64/histogram"
 	uhist "github.com/codesenberg/concurrent/uint64/histogram"
-	"github.com/satori/go.uuid"
+	"github.com/maitysubhasis/bombardier/internal"
+	uuid "github.com/satori/go.uuid"
 )
+
+type Change struct {
+	fn   func()
+	name string
+}
 
 type bombardier struct {
 	bytesRead, bytesWritten int64
@@ -36,6 +43,7 @@ type bombardier struct {
 	ratelimiter limiter
 	workers     sync.WaitGroup
 
+	// su: ***
 	timeTaken time.Duration
 	latencies *uhist.Histogram
 	requests  *fhist.Histogram
@@ -57,6 +65,19 @@ type bombardier struct {
 	// Output
 	out      io.Writer
 	template *template.Template
+
+	workersLock  sync.RWMutex
+	numConnsLock sync.RWMutex
+
+	continuteWorkers map[int64]bool
+	workersCount     int64
+
+	ready chan bool
+
+	changes        []Change
+	readyForChange bool
+	currentChange  int
+	// changeWorkerCount chan bool
 }
 
 func newBombardier(c config) (*bombardier, error) {
@@ -151,9 +172,21 @@ func newBombardier(c config) (*bombardier, error) {
 		return nil, err
 	}
 
-	b.workers.Add(int(c.numConns))
+	// b.workers.Add(int(c.numConns))
 	b.errors = newErrorMap()
 	b.doneChan = make(chan struct{}, 2)
+
+	b.continuteWorkers = make(map[int64]bool)
+	b.ready = make(chan bool, 1)
+	// b.changeWorkerCount = make(chan bool, 1)
+
+	b.workersCount = 0
+
+	b.changes = make([]Change, 0)
+	b.currentChange = 0
+	b.readyForChange = true
+	b.ready <- true
+
 	return b, nil
 }
 
@@ -221,9 +254,26 @@ func (b *bombardier) prepareTemplate() (*template.Template, error) {
 	return outputTemplate, nil
 }
 
-func (b *bombardier) writeStatistics(
-	code int, msTaken uint64,
-) {
+func (b *bombardier) applyNextChange() {
+	if b.readyForChange {
+		if b.currentChange < len(b.changes) {
+			b.readyForChange = false
+			go func() {
+				change := b.changes[b.currentChange]
+				b.currentChange++
+				change.fn()
+				fmt.Println("Running change:", change.name)
+			}()
+		}
+	}
+}
+
+func (b *bombardier) insertChange(change Change) {
+	b.changes = append(b.changes, change)
+	b.applyNextChange()
+}
+
+func (b *bombardier) writeStatistics(code int, msTaken uint64) {
 	b.latencies.Increment(msTaken)
 	b.rpl.Lock()
 	b.reqs++
@@ -243,6 +293,7 @@ func (b *bombardier) writeStatistics(
 	default:
 		counter = &b.others
 	}
+
 	atomic.AddUint64(counter, 1)
 }
 
@@ -251,20 +302,40 @@ func (b *bombardier) performSingleRequest() {
 	if err != nil {
 		b.errors.add(err)
 	}
+	// if code/100 < 1 {
+	// 	fmt.Println(code, msTaken)
+	// }
 	b.writeStatistics(code, msTaken)
 }
 
-func (b *bombardier) worker() {
+// su: each worker tries to send
+func (b *bombardier) worker(workerID int64) {
 	done := b.barrier.done()
 	for b.barrier.tryGrabWork() {
-		if b.ratelimiter.pace(done) == brk {
+		// if no limit is provided it never breaks
+		if b.ratelimiter.pace(done) == brk { // √ ?
 			break
 		}
-		b.performSingleRequest()
-		b.barrier.jobDone()
+		b.performSingleRequest() // √
+		b.barrier.jobDone()      // √
+
+		if b.killWorker(workerID) {
+			// atomic.AddInt64(&b.workersCount, -1)
+			fmt.Println("Exit worker: ", workerID)
+			break
+		}
 	}
 }
 
+func (b *bombardier) killWorker(workerID int64) bool {
+	b.workersLock.Lock()
+	ret := b.continuteWorkers[workerID] == false
+	b.workersLock.Unlock()
+	return ret
+
+}
+
+// su: impressive
 func (b *bombardier) barUpdater() {
 	done := b.barrier.done()
 	for {
@@ -281,12 +352,13 @@ func (b *bombardier) barUpdater() {
 		default:
 			current := int64(b.barrier.completed() * float64(b.bar.Total))
 			b.bar.Set64(current)
-			b.bar.Update()
+			b.bar.Update() // update progress
 			time.Sleep(b.bar.RefreshRate)
 		}
 	}
 }
 
+// su: impressed
 func (b *bombardier) rateMeter() {
 	requestsInterval := 10 * time.Millisecond
 	if b.conf.rate != nil {
@@ -323,25 +395,77 @@ func (b *bombardier) recordRps() {
 	b.requests.Increment(reqsf)
 }
 
+// final destination
 func (b *bombardier) bombard() {
 	if b.conf.printIntro {
 		b.printIntro()
 	}
+
 	b.bar.Start()
 	bombardmentBegin := time.Now()
 	b.start = time.Now()
-	for i := uint64(0); i < b.conf.numConns; i++ {
-		go func() {
-			defer b.workers.Done()
-			b.worker()
-		}()
-	}
+
+	b.addWorkers()
+
 	go b.rateMeter()
 	go b.barUpdater()
 	b.workers.Wait()
+
 	b.timeTaken = time.Since(bombardmentBegin)
-	<-b.doneChan
-	<-b.doneChan
+	<-b.doneChan // su: waiting
+	<-b.doneChan // su: waiting
+}
+
+// add new connections count
+func (b *bombardier) addNumConns(numConns uint64) {
+	b.numConnsLock.Lock()
+	b.conf.numConns += numConns
+	b.numConnsLock.Unlock()
+}
+
+// add real workers
+func (b *bombardier) addWorkers() {
+	count := int64(b.conf.numConns) - b.workersCount
+	b.workers.Add(int(count))
+	for i := count; i > 0; i-- {
+		go func() {
+			defer b.workers.Done()
+			workerID := atomic.AddInt64(&b.workersCount, 1)
+			if workerID == int64(b.conf.numConns) {
+				fmt.Println("Now exec next change")
+				b.readyForChange = true
+				b.applyNextChange()
+			}
+			b.addWorkerID(workerID)
+			b.worker(workerID)
+		}()
+	}
+	// b.changeWorkerCount <- true
+}
+
+func (b *bombardier) removeWorkers(count uint64) {
+	success := uint64(0)
+	_count := int64(count)
+	if b.conf.numConns > count {
+		b.workersLock.Lock()
+		for id := int64(0); id < _count; id++ {
+			fmt.Println(b.workersCount-id, id)
+			if _, ok := b.continuteWorkers[b.workersCount-id]; ok {
+				success++
+				b.continuteWorkers[b.workersCount-id] = false
+			}
+		}
+		b.workersLock.Unlock()
+		atomic.AddInt64(&b.workersCount, -_count)
+		b.addNumConns(-success)
+	}
+	b.applyNextChange()
+}
+
+func (b *bombardier) addWorkerID(workerID int64) {
+	b.workersLock.Lock()
+	b.continuteWorkers[workerID] = true
+	b.workersLock.Unlock()
 }
 
 func (b *bombardier) printIntro() {
@@ -355,6 +479,7 @@ func (b *bombardier) printIntro() {
 	}
 }
 
+// su: this can be overwritten
 func (b *bombardier) gatherInfo() internal.TestInfo {
 	info := internal.TestInfo{
 		Spec: internal.Spec{
@@ -441,23 +566,95 @@ func (b *bombardier) disableOutput() {
 
 func main() {
 	cfg, err := parser.parse(os.Args)
+	done := make(chan bool, 1)
+
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(exitFailure)
 	}
+
 	bombardier, err := newBombardier(cfg)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(exitFailure)
 	}
 	c := make(chan os.Signal, 1)
+
+	cancel := func() {
+		bombardier.barrier.cancel()
+		done <- true
+	}
+
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		<-c
-		bombardier.barrier.cancel()
+		cancel()
 	}()
-	bombardier.bombard()
+
+	// 1. need systamatic connection creation and closing
+	// 2. ramp up/down
+	// 3.
+
+	// su: more controlled bombarding is needed
+	bombardier.insertChange(Change{
+		func() {
+			bombardier.bombard()
+			done <- true
+		},
+		"bombard",
+	})
+
+	// <-bombardier.ready
+	// fmt.Println("All workers are ready.")
+	// time.Sleep(1 * time.Millisecond)
+	// fn := func() {
+	// 	bombardier.removeWorkers(800)
+	// }
+	// fmt.Println(fn)
+	// bombardier.insertChange(Change{
+	// 	func() {
+	// 		bombardier.removeWorkers(90)
+	// 	},
+	// 	"removeWorkers",
+	// })
+
+	// time.Sleep(10 * time.Millisecond)
+	// bombardier.addNumConns(2)
+	// bombardier.addWorkers()
+
+	<-done
+
+	// su: need aggregate function from different bombardier
 	if bombardier.conf.printResult {
 		bombardier.printStats()
 	}
+
+	info := bombardier.gatherInfo()
+
+	fmt.Println("")
+	fmt.Println(bombardier.conf.numConns)
+	fmt.Println(bombardier.requests.Count())
+	info.Result.Requests.VisitAll(func(f float64, c uint64) bool {
+		// fmt.Println(f, c)
+		return true
+	})
+
+	info.Result.Latencies.VisitAll(func(f uint64, c uint64) bool {
+		// fmt.Println(f, c)
+		return true
+	})
+	// fmt.Println("")
+	// fmt.Println(info.Result.Latencies.Count())
+	// result := info.Result
+	// fmt.Println("Total request:", result.Req1XX+result.Req2XX+result.Req3XX+result.Req4XX+result.Req5XX)
 }
+
+// ramp up, ramp down - sudden(done)
+// ramp up, ramp down - over a period of time(???)
+// total request (done)
+// Req/s(done), Latency(done)
+// avg(done), stdDev(done), Max(done)
+// Http codes, -> done
+// throughput -> done
+
+// use internals/test_info.go for reference

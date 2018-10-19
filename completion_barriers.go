@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// ???
 type completionBarrier interface {
 	completed() float64
 	tryGrabWork() bool

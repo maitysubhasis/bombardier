@@ -93,7 +93,7 @@ func (c *fasthttpClient) do() (
 	} else {
 		code = resp.StatusCode()
 	}
-	msTaken = uint64(time.Since(start).Nanoseconds() / 1000)
+	msTaken = uint64(time.Since(start).Nanoseconds())
 
 	// release resources
 	fasthttp.ReleaseRequest(req)
